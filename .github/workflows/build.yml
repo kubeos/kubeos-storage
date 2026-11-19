@@ -1,0 +1,14 @@
+# Build this package the way the KubeOS archive does, on every push.
+# The workflow itself lives in kubeos-apt so all the package repositories share one definition:
+# fix it once there. Nothing here signs or publishes - see that file for what it does and why.
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  deb:
+    uses: kubeos/kubeos-apt/.github/workflows/deb-build.yml@main
+    with:
+      package: kubeos-storage
