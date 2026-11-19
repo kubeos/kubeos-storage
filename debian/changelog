@@ -1,3 +1,11 @@
+kubeos-storage (1.0.0-1kubeos4) trixie; urgency=medium
+
+  * The postinst must ignore commented-out fstab lines. On the live node the pod-data
+    line had been commented out by hand during recovery and the postinst still edited it
+    and reported success, which is worse than doing nothing.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 11:55:00 +0530
+
 kubeos-storage (1.0.0-1kubeos3) trixie; urgency=medium
 
   * The pod-data fstab line gets nofail, x-systemd.device-timeout=30s and an fsck pass
