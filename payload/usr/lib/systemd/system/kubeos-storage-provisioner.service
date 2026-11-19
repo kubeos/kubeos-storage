@@ -1,0 +1,42 @@
+# KubeOS: dynamic local storage as a native systemd service.
+#
+# WHY A HOST UNIT AND NOT A DEPLOYMENT: the upstream provisioner needs a helper Pod
+# per volume just to run `mkdir` on the node, which costs a second container image
+# (busybox) in an offline ISO and puts helper Pods on a node whose design keeps its
+# own services off Pods. The two operations a local provisioner really performs -
+# make the directory, create the PV object - are host operations, so they run here.
+# Full reasoning and the measurement that killed the alternative: the header of
+# /usr/bin/kubeos-storage-provisioner and AGENTS.md section 14.
+#
+# ConditionPathExists is what keeps this unit safe on the very first boot: the
+# kubeconfig it authenticates with is minted by node-setup, and node-setup enables
+# and starts this unit itself once that file exists. On later boots the file is
+# already there and systemd starts it normally.
+#
+# It is deliberately NOT cluster-admin: /etc/kubernetes/storage-provisioner.conf is a
+# client certificate with CN=system:storage-provisioner, bound in native-services.yaml
+# to a ClusterRole that can only watch claims, create/delete PVs and read nodes.
+#
+# Reboot behaviour: nothing is lost. The PVs and the directories on the pod-data LV
+# persist, so claims come back Bound; the service only ever creates what is missing.
+[Unit]
+Description=KubeOS local storage provisioner
+Documentation=https://kubeos.in/
+ConditionPathExists=/etc/kubernetes/storage-provisioner.conf
+After=network-online.target kube-apiserver.service kube-proxy.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/bin/kubeos-storage-provisioner
+# Never give up: storage that stops being provisioned is invisible until a claim
+# hangs, which is exactly the failure this project already paid for once.
+Restart=always
+RestartSec=5
+# Only the pod-data volume is written to; systemd's default sandbox is enough, and
+# stronger hardening (ProtectSystem=strict) would need an explicit
+# ReadWritePaths= for the LV - see the note in AGENTS.md if this ever tightens.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target

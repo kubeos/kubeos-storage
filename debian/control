@@ -1,0 +1,22 @@
+Source: kubeos-storage
+Section: admin
+Priority: optional
+Maintainer: KubeOS <mail@kubeos.in>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://kubeos.in/
+
+Package: kubeos-storage
+Architecture: all
+Depends: ${misc:Depends}, lvm2, xfsprogs, python3
+Description: KubeOS dynamic local storage: the pod-data volume and its provisioner
+ First boot takes the free space the installer deliberately leaves inside kubeos-vg,
+ creates a thin pool, formats the pod-data volume with XFS and mounts it at
+ /opt/local-path-provisioner, so workload data never fills /. kubeos-storage-provisioner
+ then serves the default "local-path" StorageClass from that volume as a plain systemd
+ service - no helper Pod per volume, which is the whole reason it replaced upstream's
+ design on an appliance that runs no Pods in its base system.
+ .
+ Both operations are idempotent and never destroy data: the pool is only created when it
+ does not exist, and a formatted volume is never re-formatted.

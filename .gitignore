@@ -1,0 +1,8 @@
+debian/files
+debian/*.substvars
+debian/.debhelper/
+debian/debhelper-build-stamp
+debian/kubeos-storage/
+*.deb
+*.buildinfo
+*.changes

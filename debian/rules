@@ -1,0 +1,9 @@
+#!/usr/bin/make -f
+%:
+	dh $@
+
+# /etc/kubeos/storage.conf is written by the installer and /etc/fstab by first boot: this
+# package ships neither, and has no conffile of its own (D5).
+override_dh_installdeb:
+	dh_installdeb
+	: > debian/kubeos-storage/DEBIAN/conffiles

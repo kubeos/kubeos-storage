@@ -1,0 +1,17 @@
+KubeOS: this directory is a mountpoint.
+
+/opt/local-path-provisioner is where local-path-provisioner (the default
+StorageClass) keeps every PersistentVolume it hands out. On KubeOS it is NOT part
+of the root filesystem: first boot creates the thin LVM pool kubeos-vg/kubeos-data,
+formats the thin volume kubeos-vg/pod-data with XFS and mounts it here (see
+/usr/bin/kubeos-storage-init and /etc/fstab), so workload data never fills /.
+
+This placeholder file exists only so the directory is present in the image even if
+first boot has not run yet. Once the pool is mounted it is hidden behind the
+mount. Check where you actually are with:
+
+    findmnt /opt/local-path-provisioner
+
+If that prints nothing, the mount is gone and anything written here is going to
+the root filesystem - fix that with `mount /opt/local-path-provisioner` and read
+`journalctl -u node-setup -b`.

@@ -1,0 +1,255 @@
+#!/bin/sh
+# KubeOS: create the thin-LVM pool that holds pod data, format it and mount it.
+#
+# WHEN   First boot, from node-setup.service, BEFORE node-setup
+#        (the pool must exist before anything schedules workloads). Runs once; the
+#        pool and the fstab entry make later runs cheap no-ops.
+# WHY    The installer leaves the space for pod data unallocated inside kubeos-vg
+#        on purpose (guided_size = root + swap). This is the script that turns
+#        that free space into a thin pool, Proxmox-style: root stays small and
+#        holds the base system (containerd's overlayfs store, the kubeadm images,
+#        every kube-system pod), while everything a *workload* persists lands on
+#        the pool and can be grown, snapshotted and over-provisioned without
+#        touching /. local-path-provisioner already writes to
+#        /opt/local-path-provisioner, so the thin LV is mounted exactly there and
+#        the provisioner's manifest needs no change.
+# SAFE   Never destroys data. It only acts when the pool does not exist yet, and
+#        even then it only touches space that is free in the volume group. If the
+#        pool already exists it just re-checks the mount, the fstab entry and the
+#        timers, so it is safe to re-run after a failed first boot. It never fails
+#        the cluster setup: a node without dynamic storage still runs workloads
+#        (same contract as steps 6 and 7 of node-ready), but it says so
+#        loudly, because without the pool pod data silently lands on / again.
+#
+# Sizing: the pool takes ALL the volume group's remaining free space, minus the
+# reserve the installer asked for ("minfree": the minimum amount of disk that
+# should stay unused). That reserve is a soft target, not a rule: leaving space
+# unallocated in the VG is good practice (room for LVM metadata, a spare metadata
+# LV, an emergency snapshot), but if honouring it would leave less than the
+# minimum pool size, the reserve is reduced rather than no pool being created -
+# an appliance with pod storage and a smaller cushion beats an appliance whose pod
+# data quietly lands on /. The thin LV pod-data is created at the pool's full
+# size: it is a thin volume, so the filesystem can grow into the whole pool while
+# the pool only allocates what is actually written.
+#
+# Two properties of thin pools worth knowing when reading the logs:
+#   * a FULL pool (data_percent 100) makes every further write fail and the pool
+#     flips to read-only - extend it with `lvextend -L +NG kubeos-vg/kubeos-data`
+#     (the thin LV grows too, then xfs_growfs);
+#   * blocks freed inside the filesystem are only returned to the pool if the
+#     filesystem passes them on - hence `discard` here AND fstrim.timer.
+set -eu
+
+CONF=/etc/kubeos/storage.conf       # written by the installer, one line per answer
+STATE_DIR=/var/lib/kubeos
+DONE="$STATE_DIR/storage-initialized"
+
+# Defaults: the installer's hand-off overrides these, so a missing file still
+# produces a working pool instead of no storage at all.
+VG=kubeos-vg
+DATA_POOL=kubeos-data
+DATA_LV=pod-data
+DATA_MOUNT=/opt/local-path-provisioner
+MINFREE_GIB=8
+
+CHUNK_SIZE=64k                 # Proxmox's default; 64k is a good middle ground
+MIN_POOL_MIB=1024              # below this a data pool is not worth creating
+MIN_META_MIB=128
+# XFS takes at most 12 characters for -L ("kubeos-pod-data" is 15 and mkfs.xfs
+# refuses it with "Invalid value ... for -L option"). 12 also fits ext4's 16, so
+# the constant stays usable whichever filesystem FSTYPE names.
+FS_LABEL=kubeos-pod
+MAX_META_MIB=1024
+FSTYPE=xfs
+
+log() { echo "kubeos-storage: $*"; logger -t kubeos-storage "$*" 2>/dev/null || true; }
+
+# State and markers are conveniences: a read-only /var must not stop the pool from
+# being created and mounted.
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+
+# "WARNING" lines are the ones a human must read: they mean pod data is not where
+# this script wants it. Everything else is progress.
+warn() { log "WARNING: $*"; }
+
+is_uint() {
+    case ${1:-} in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    return 0
+}
+
+if [ -r "$CONF" ]; then
+    # Written by us, key=value only, no execute bits - a plain read is enough.
+    # shellcheck disable=SC1090
+    . "$CONF"
+    log "layout answers from $CONF: maxdata ${MAXDATA_GIB:-?} GiB, minfree ${MINFREE_GIB:-?} GiB"
+else
+    warn "$CONF is missing (the installer hand-off did not happen); using defaults: reserve ${MINFREE_GIB} GiB"
+fi
+# A truncated or hand-edited file must not turn into a shell arithmetic error, so
+# every number that reaches $(( )) is checked first.
+if ! is_uint "${MINFREE_GIB:-}"; then
+    warn "MINFREE_GIB='${MINFREE_GIB:-}' is not a number; falling back to 8 GiB"
+    MINFREE_GIB=8
+fi
+
+# Cheap guard so a later edit of FS_LABEL cannot reproduce the 2026-11-10 bug
+# (a 15-character label, rejected by mkfs.xfs, which left pod data on /).
+if [ "${#FS_LABEL}" -gt 12 ]; then
+    warn "filesystem label '$FS_LABEL' is ${#FS_LABEL} characters; filesystem labels are limited to 12 - truncating"
+    FS_LABEL=$(printf '%s' "$FS_LABEL" | cut -c1-12)
+fi
+
+if ! vgs "$VG" >/dev/null 2>&1; then
+    warn "volume group $VG does not exist; no thin pool created and pod data stays on /"
+    exit 0
+fi
+
+pool_exists() { lvs "$VG/$DATA_POOL" >/dev/null 2>&1; }
+
+# ---- 1. create the pool and the thin LV (once) ------------------------------
+if pool_exists; then
+    log "thin pool $VG/$DATA_POOL already exists; not touching it"
+else
+    free_mib=$(vgs --noheadings --units m --nosuffix -o vg_free "$VG" | awk '{ printf "%d", $1 }')
+    # Empty output (a broken vgs, or a VG that disappeared between the two calls)
+    # must not reach $(( )) as an empty string.
+    is_uint "${free_mib:-}" || free_mib=0
+    reserve_mib=$(( MINFREE_GIB * 1024 ))
+
+    # No space at all means no pool, and that is a real failure worth a warning.
+    if [ "$free_mib" -le "$MIN_POOL_MIB" ]; then
+        warn "only ${free_mib} MiB free in $VG, too little for a ${MIN_POOL_MIB} MiB pool; no pool created, pod data stays on /"
+        exit 0
+    fi
+
+    # minfree is a SOFT target (user decision 2026-11-10: "leaving a minfree
+    # reserve is still a good safety practice for the VG itself... not enforce").
+    # Keeping some space unallocated in the volume group is good hygiene - room for
+    # LVM metadata, a spares LV, an emergency snapshot - but it must never be the
+    # reason a machine ends up with no pod storage at all. So honour the reserve
+    # when there is room for it, and otherwise shrink the reserve down to whatever
+    # is left above the minimum pool size, saying so in the journal.
+    # The metadata LV and the pmspare LV LVM creates next to it are real
+    # allocations OUTSIDE the pool's data size, so they eat into the reserve:
+    # measured 2026-11-10, a "leave 1024 MiB unused" run ended with 664 MiB free
+    # because 180 MiB metadata + 180 MiB pmspare were taken from that reserve.
+    # Subtracting both keeps the promise the journal makes.
+    avail_mib=$(( free_mib - reserve_mib ))
+    meta_guess=$(awk -v p="$avail_mib" -v lo="$MIN_META_MIB" -v hi="$MAX_META_MIB" \
+        'BEGIN { m = int(p / 100); if (m < lo) m = lo; if (m > hi) m = hi; printf "%d", m }')
+    reserve_used=$reserve_mib
+    pool_mib=$(( avail_mib - 2 * meta_guess ))
+    if [ "$pool_mib" -lt "$MIN_POOL_MIB" ]; then
+        reserve_used=$(( free_mib - MIN_POOL_MIB - 2 * meta_guess ))
+        [ "$reserve_used" -lt 0 ] && reserve_used=0
+        pool_mib=$MIN_POOL_MIB
+        warn "a ${reserve_mib} MiB minfree reserve would leave only $(( free_mib - reserve_mib )) MiB for pod data; reserve reduced to ${reserve_used} MiB and the pool created at ${pool_mib} MiB instead (space stays usable, not untouched)"
+    fi
+    # Metadata is ~10x the 0.1% LVM needs for 64k chunks, capped so a small disk
+    # does not spend a big share of the pool on mapping tables.
+    meta_mib=$(awk -v p="$pool_mib" -v lo="$MIN_META_MIB" -v hi="$MAX_META_MIB" \
+        'BEGIN { m = int(p / 100); if (m < lo) m = lo; if (m > hi) m = hi; printf "%d", m }')
+
+    log "creating thin pool $VG/$DATA_POOL: ${pool_mib} MiB data + ${meta_mib} MiB metadata, leaving ${reserve_used} MiB of the volume group unused"
+    # Every lvcreate/mkfs failure below is caught: with set -e an unguarded failure
+    # would exit non-zero, systemd would retry the whole cluster setup every 60 s
+    # and the node would never come up. Storage is valuable but not worth an
+    # unbootable appliance.
+    if ! lvcreate --yes --type thin-pool --chunksize "$CHUNK_SIZE" \
+            --poolmetadatasize "${meta_mib}m" --size "${pool_mib}m" \
+            --name "$DATA_POOL" "$VG" >/dev/null; then
+        warn "lvcreate of the thin pool failed; pod data stays on / (see: lvs, vgs, dmesg)"
+        exit 0
+    fi
+
+    real_free=$(vgs --noheadings --units m --nosuffix -o vg_free "$VG" | awk '{ printf "%d", $1 }')
+    is_uint "${real_free:-}" || real_free=0
+    log "volume group free after the pool: ${real_free} MiB (reserve asked for: ${reserve_used} MiB)"
+
+    log "creating thin volume $VG/$DATA_LV sized to the whole pool (${pool_mib} MiB virtual)"
+    if ! lvcreate --yes --virtualsize "${pool_mib}m" --thin "$VG/$DATA_POOL" --name "$DATA_LV" >/dev/null; then
+        warn "lvcreate of $DATA_LV failed although the pool exists; pod data stays on /"
+        exit 0
+    fi
+fi
+
+if ! lvs "$VG/$DATA_LV" >/dev/null 2>&1; then
+    warn "thin volume $VG/$DATA_LV is missing although the pool exists; pod data stays on /"
+    exit 0
+fi
+
+LVDEV="/dev/$VG/$DATA_LV"
+
+# ---- 2. filesystem (only if there is none yet) ------------------------------
+if blkid -s TYPE -o value "$LVDEV" 2>/dev/null | grep -q .; then
+    log "$LVDEV already carries $(blkid -s TYPE -o value "$LVDEV"); not formatting"
+else
+    log "formatting $LVDEV with $FSTYPE (label $FS_LABEL)"
+    if ! mkfs."$FSTYPE" -f -L "$FS_LABEL" "$LVDEV" >/dev/null; then
+        warn "mkfs.$FSTYPE failed on $LVDEV (is xfsprogs installed?); pod data stays on /"
+        exit 0
+    fi
+fi
+
+# `|| true`: this script's contract is "warn and exit 0" for every failure after the format step,
+# but an unguarded blkid exiting 2 aborted the whole script under `set -e`, which failed
+# node-setup.service and restarted first boot.
+uuid=$(blkid -s UUID -o value "$LVDEV" 2>/dev/null || true)
+if [ -z "${uuid:-}" ]; then
+    warn "cannot read the UUID of $LVDEV; not touching /etc/fstab, pod data stays on /"
+    exit 0
+fi
+
+# ---- 3. mount it on every boot, at the path local-path already uses ---------
+mkdir -p "$DATA_MOUNT"
+
+# fstab by UUID, not by /dev/kubeos-vg/... - the device name is fine on this
+# single-node appliance, but the UUID survives a VG rename and is what every
+# other Debian tool expects. Any earlier line for this mountpoint is replaced so
+# a second run cannot stack duplicates.
+# Temp file next to /etc/fstab: same filesystem, so the final copy is a rename-free
+# overwrite of an existing file (permissions and inode stay as the installer left
+# them) and no dependency on STATE_DIR being writable.
+tmp=/etc/.fstab.kubeos.new
+{
+    grep -vF " $DATA_MOUNT " /etc/fstab || true
+    printf '# KubeOS: pod data on the thin pool (%s/%s). The discard option returns freed\n' "$VG" "$DATA_POOL"
+    printf '# blocks to the pool, and fstrim.timer is enabled as well, because online\n'
+    printf '# discard is best-effort and a pool that is never trimmed only ever grows.\n'
+    printf 'UUID=%s %s %s defaults,discard 0 2\n' "$uuid" "$DATA_MOUNT" "$FSTYPE"
+} > "$tmp"
+cat "$tmp" > /etc/fstab
+rm -f "$tmp"
+# systemd caches fstab at boot: without this, `mount` prints "your fstab has been
+# modified, but systemd still uses the old version" and the mount unit systemd
+# will use at shutdown/reboot is the stale no-op one. Reload before mounting.
+systemctl daemon-reload 2>/dev/null || true
+
+if mountpoint -q "$DATA_MOUNT"; then
+    log "$DATA_MOUNT is already mounted"
+else
+    if mount "$DATA_MOUNT"; then
+        log "mounted $DATA_MOUNT"
+    else
+        warn "mounting $DATA_MOUNT failed; pod data stays on / until this is fixed"
+        exit 0
+    fi
+fi
+
+# ---- 4. keep the pool trimmed, and say how full it is -----------------------
+if systemctl enable --now fstrim.timer >/dev/null 2>&1; then
+    log "fstrim.timer enabled"
+else
+    warn "could not enable fstrim.timer; the thin pool will only ever grow"
+fi
+
+usage=$(lvs --noheadings --units g -o lv_size,data_percent,metadata_percent "$VG/$DATA_POOL" 2>/dev/null | tr -s ' ')
+log "pool usage right now (size, data%, metadata%):$usage"
+log "filesystem on $DATA_MOUNT: $(df -h "$DATA_MOUNT" | awk 'NR == 2 { print $2 " total, " $4 " free" }')"
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+: > "$DONE" 2>/dev/null || true
+log "done: pod data lives on $LVDEV mounted at $DATA_MOUNT"
+exit 0

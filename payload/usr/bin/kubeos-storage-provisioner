@@ -1,0 +1,325 @@
+#!/usr/bin/env python3
+# KubeOS: dynamic local storage as a native systemd service.
+#
+# WHEN   Started by kubeos-storage-provisioner.service on every boot, right after the
+#        API server (first boot also starts it explicitly, once its kubeconfig exists).
+#        Runs for the life of the node; every 5 s it looks for claims it has to satisfy.
+#
+# WHY    A KubeOS node must offer dynamic storage: without a StorageClass every PVC
+#        stays Pending and no stateful workload (database, registry, queue) can run.
+#        The upstream answer, rancher/local-path-provisioner, cannot be used here as
+#        it ships: it creates a HELPER POD per volume whose only job is to run
+#        `mkdir -m 0777 -p` (and `rm -rf` on teardown) on the node - measured
+#        2026-11-11, it does that in EVERY mode, including sharedFileSystemPath,
+#        where the helper mounts the ConfigMap key `setup` at /script and runs
+#        `/bin/sh /script/setup -p <dir> ...`. On an offline appliance that means a
+#        second container image (busybox) to bake, pin and trust, helper Pods
+#        appearing on a node whose whole design keeps its own services off Pods, and
+#        a second place that can fail mid-provision. KubeOS already has the harder
+#        half of a provisioner: kubeos-storage-init formats the pod-data LV and
+#        mounts it at /opt/local-path-provisioner. What is missing is only the two
+#        things a provisioner actually does - make the directory, create the PV
+#        object - and both are host operations, so this runs as a host service.
+#
+#        It is a STATIC provisioner behind a dynamic-looking class: for each claim it
+#        creates a PRE-BOUND PV (spec.claimRef = that claim), which the PV controller
+#        binds immediately. No CSI, no external-provisioner sidecar, no helper Pod,
+#        no image.
+#
+# SAFE   Re-runnable and idempotent: creating an existing PV is a no-op (AlreadyExists
+#        is the expected answer, not an error), an existing directory is reused, and
+#        the orphan sweep only removes a directory when NEITHER a PVC nor a PV
+#        references its uid - and it is skipped entirely for a round in which the PV
+#        list could not be read. It never deletes a bound volume. Failures are logged
+#        and retried on the next round; the process does not exit on API errors (a
+#        provisioner that dies stops all future storage).
+#
+# Volumes live on the node's own disk: /opt/local-path-provisioner is the XFS
+# pod-data LV that kubeos-storage-init creates, NOT a directory on the root
+# filesystem. Keep DATA_ROOT in sync with DATA_MOUNT in that script.
+
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+KUBECONFIG = os.environ.get("KUBECONFIG", "/etc/kubernetes/storage-provisioner.conf")
+DATA_ROOT = "/opt/local-path-provisioner"
+CLASS_NAME = "local-path"
+POLL_SECONDS = 5
+KUBECTL_TIMEOUT = 30
+MANAGED_BY = "storage-provisioner"
+MANAGED_BY_LABEL = {"kubeos.io/managed-by": MANAGED_BY}
+DEFAULT_CAPACITY = "1Gi"
+TAG = "kubeos-storage-provisioner:"
+
+STOP = False
+# Until the API answers once, a refused connection is the expected state at boot
+# (systemd starts us as soon as kube-apiserver has exec'd, not when it serves), so
+# those failures are not logged as warnings - a scary WARNING on every boot in a
+# healthy journal is how real warnings stop being read.
+API_READY = False
+
+
+def log(msg):
+    print(f"{TAG} {msg}", flush=True)
+
+
+def on_term(_signum, _frame):
+    """Finish the current round and exit cleanly (systemd sends SIGTERM)."""
+    global STOP
+    STOP = True
+
+
+def kubectl(args, stdin_data=None, quiet=False):
+    """Run kubectl and return (ok, stdout). Never raises: a provisioner must survive.
+
+    quiet=True is for calls whose failure is an expected answer rather than a fault -
+    "this claim no longer exists" is how the reclaim step finds work to do, and
+    logging it as a WARNING made a healthy cleanup look like a broken round.
+    """
+    cmd = ["kubectl", f"--kubeconfig={KUBECONFIG}"] + args
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=stdin_data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=KUBECTL_TIMEOUT,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        log(f"WARNING: kubectl {' '.join(args)} timed out after {KUBECTL_TIMEOUT}s")
+        return False, ""
+    except OSError as exc:
+        log(f"WARNING: could not run kubectl: {exc}")
+        return False, ""
+    if proc.returncode != 0:
+        if not quiet:
+            first = (proc.stderr.strip().splitlines() or [""])[0]
+            log(f"WARNING: kubectl {' '.join(args)} failed: {first}")
+        return False, proc.stdout
+    return True, proc.stdout
+
+
+def list_json(resource, extra=(), quiet=False):
+    """Return the items of a kubectl list call, or None when it could not be read."""
+    ok, out = kubectl(["get", resource, *extra, "-o", "json"], quiet=quiet)
+    if not ok:
+        return None
+    try:
+        return json.loads(out).get("items", [])
+    except json.JSONDecodeError as exc:
+        log(f"WARNING: could not parse kubectl output for {resource}: {exc}")
+        return None
+
+
+def volume_dir(uid):
+    return os.path.join(DATA_ROOT, f"pvc-{uid}")
+
+
+def claim_wants_us(claim):
+    """Is this claim one of ours, and ready to be provisioned?"""
+    if claim.get("metadata", {}).get("deletionTimestamp"):
+        return False
+    if claim.get("status", {}).get("phase") != "Pending":
+        return False
+    spec = claim.get("spec", {})
+    # storageClassName may be absent on very old objects but ours is always explicit.
+    if spec.get("storageClassName") != CLASS_NAME:
+        return False
+    # WaitForFirstConsumer: the scheduler stamps the chosen node only once a Pod
+    # consumes the claim. Without it a local volume has no node to belong to - this
+    # is the trap that kept every KubeOS PVC Pending for days (AGENTS.md section 14).
+    annotations = claim.get("metadata", {}).get("annotations") or {}
+    if not annotations.get("volume.kubernetes.io/selected-node"):
+        return False
+    return True
+
+
+def build_pv(claim, node):
+    meta = claim["metadata"]
+    uid = meta["uid"]
+    spec = claim["spec"]
+    capacity = (spec.get("resources", {}).get("requests", {}) or {}).get("storage")
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolume",
+        "metadata": {
+            "name": f"pvc-{uid}",
+            "labels": dict(MANAGED_BY_LABEL),
+            "annotations": {
+                "kubeos.io/claim": f"{meta['namespace']}/{meta['name']}",
+                "kubeos.io/node": node,
+            },
+        },
+        "spec": {
+            "capacity": {"storage": capacity or DEFAULT_CAPACITY},
+            "accessModes": spec.get("accessModes") or ["ReadWriteOnce"],
+            "volumeMode": spec.get("volumeMode") or "Filesystem",
+            # Delete so a removed claim also removes the PV object; the directory is
+            # then reclaimed by the orphan sweep below, which is the only place that
+            # ever touches the disk.
+            "persistentVolumeReclaimPolicy": "Delete",
+            "storageClassName": CLASS_NAME,
+            # Pre-binding: the PV controller binds the claim at once, so the claim
+            # never waits for a second provisioning round.
+            "claimRef": {
+                "apiVersion": "v1",
+                "kind": "PersistentVolumeClaim",
+                "namespace": meta["namespace"],
+                "name": meta["name"],
+                "uid": uid,
+            },
+            "hostPath": {"path": volume_dir(uid), "type": "DirectoryOrCreate"},
+            "nodeAffinity": {
+                "required": {
+                    "nodeSelectorTerms": [
+                        {
+                            "matchExpressions": [
+                                {
+                                    "key": "kubernetes.io/hostname",
+                                    "operator": "In",
+                                    "values": [node],
+                                }
+                            ]
+                        }
+                    ]
+                }
+            },
+        },
+    }
+
+
+def provision(claim):
+    meta = claim["metadata"]
+    uid = meta["uid"]
+    node = meta["annotations"]["volume.kubernetes.io/selected-node"]
+    directory = volume_dir(uid)
+
+    # 0777 like the upstream helper's `mkdir -m 0777`: a Pod may run as any UID and
+    # there is no CSI to translate ownership on a single-user appliance.
+    try:
+        os.makedirs(directory, mode=0o777, exist_ok=True)
+        os.chmod(directory, 0o777)
+    except OSError as exc:
+        log(f"ERROR: could not create {directory}: {exc}")
+        return
+
+    payload = json.dumps({"apiVersion": "v1", "kind": "List", "items": [build_pv(claim, node)]})
+    ok, out = kubectl(["create", "-f", "-"], stdin_data=payload)
+    if ok:
+        log(f"provisioned {meta['namespace']}/{meta['name']} -> {directory}")
+        return
+    # AlreadyExists means a previous round (or a previous boot) did the work already.
+    if "AlreadyExists" in (out or "") or "already exists" in (out or ""):
+        return
+
+
+def reclaim(pvs):
+    """Delete our PVs whose claim is gone, so the sweep can reclaim their directory.
+
+    MEASURED 2026-11-11, and the reason this function has to exist: Kubernetes has no
+    "deleter" plugin for hostPath volumes, so when a claim is deleted the PV
+    controller cannot honour `persistentVolumeReclaimPolicy: Delete` - it parks the PV
+    in phase `Failed` (not `Released`) and leaves both the object and the directory
+    behind. Nothing in the cluster will ever clean that up; a provisioner that owns the
+    bytes has to do it itself. Returns True when something was deleted.
+    """
+    if pvs is None:
+        return False
+    deleted = False
+    for pv in pvs:
+        meta = pv.get("metadata", {})
+        if (meta.get("labels") or {}).get("kubeos.io/managed-by") != MANAGED_BY:
+            continue
+        if pv.get("status", {}).get("phase") not in ("Released", "Failed"):
+            continue
+        claim_ref = (pv.get("spec", {}).get("claimRef") or {})
+        namespace, name = claim_ref.get("namespace"), claim_ref.get("name")
+        if namespace and name:
+            still_there, _ = kubectl(
+                ["get", "pvc", name, "--namespace", namespace, "-o", "name"], quiet=True
+            )
+            if still_there:
+                continue  # the claim exists: the PV is not ours to remove
+        ok, _ = kubectl(["delete", "pv", meta["name"], "--ignore-not-found"])
+        if ok:
+            log(f"reclaimed PV {meta['name']} (its claim is gone)")
+            deleted = True
+    return deleted
+
+
+def sweep(pvs, claims):
+    """Remove directories whose uid nothing references any more."""
+    if pvs is None or claims is None:
+        # One of the two lists is unknown: deleting now could destroy a live volume.
+        log("WARNING: skipping the orphan sweep this round (a list could not be read)")
+        return
+    live = {pv["metadata"]["name"] for pv in pvs if pv["metadata"]["name"].startswith("pvc-")}
+    live |= {c["metadata"]["uid"] for c in claims}
+    try:
+        entries = os.listdir(DATA_ROOT)
+    except OSError as exc:
+        log(f"WARNING: could not read {DATA_ROOT}: {exc}")
+        return
+    for entry in entries:
+        if not entry.startswith("pvc-"):
+            continue
+        name = entry[len("pvc-"):]
+        if f"pvc-{name}" in live or name in live:
+            continue
+        path = os.path.join(DATA_ROOT, entry)
+        try:
+            shutil.rmtree(path)
+            log(f"reclaimed {path} (no PVC and no PV references it)")
+        except OSError as exc:
+            log(f"WARNING: could not remove {path}: {exc}")
+
+
+def one_round():
+    global API_READY
+    claims = list_json("pvc", ("--all-namespaces",), quiet=not API_READY)
+    if claims is None:
+        return
+    if not API_READY:
+        API_READY = True
+        log("API reachable; watching claims")
+    for claim in claims:
+        if claim_wants_us(claim):
+            provision(claim)
+    # Sweep from a fresh view: after provisioning, so a PV created above is not seen
+    # as absent, and after a failed claim list the sweep is skipped entirely. If the
+    # reclaim step removed a PV, the list must be read again or the sweep would still
+    # see that name and keep its directory.
+    pvs = list_json("pv")
+    if reclaim(pvs):
+        pvs = list_json("pv")
+    sweep(pvs, claims)
+
+
+def main():
+    signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGINT, on_term)
+    if not os.path.isdir(DATA_ROOT):
+        log(f"WARNING: {DATA_ROOT} does not exist (is the pod-data volume mounted?)")
+    log(f"watching for Pending claims with storageClassName {CLASS_NAME}, root {DATA_ROOT}")
+    while not STOP:
+        try:
+            one_round()
+        except Exception as exc:  # noqa: BLE001 - the daemon must outlive any single bug
+            log(f"ERROR: unexpected failure in this round: {exc}")
+        for _ in range(POLL_SECONDS):
+            if STOP:
+                break
+            time.sleep(1)
+    log("stopping")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
