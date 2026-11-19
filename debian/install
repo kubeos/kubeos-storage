@@ -1,3 +1,4 @@
 payload/usr/bin/*                          usr/bin/
 payload/usr/lib/systemd/system/*.service   usr/lib/systemd/system/
 payload/opt/local-path-provisioner/.kubeos-mountpoint   opt/local-path-provisioner/
+payload/usr/lib/systemd/system/multi-user.target.wants/*  usr/lib/systemd/system/multi-user.target.wants/

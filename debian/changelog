@@ -1,3 +1,13 @@
+kubeos-storage (1.0.0-1kubeos2) trixie; urgency=medium
+
+  * Ship the unit enablement as a package file. Build hook 9050 called
+    systemctl enable for these units, which a package must not do: it aborts a
+    chroot build (the trap documented in that hook). A .wants symlink owned by
+    dpkg is the same declaration, so a node installed from the archive alone
+    comes up identically.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 10:30:00 +0530
+
 kubeos-storage (1.0.0-1kubeos1) trixie; urgency=medium
 
   * Initial packaging: kubeos-storage-init, kubeos-storage-provisioner, the unit that
