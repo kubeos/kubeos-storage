@@ -1,0 +1,45 @@
+#!/bin/sh
+# KubeOS storage, postinst: make sure the pod-data mount can never block a boot.
+#
+# WHY    Until 1.0.0-1kubeos3 the fstab line for /opt/local-path-provisioner had no "nofail".
+#        Pod data is the only thing that mount holds, and when the thin pool fails to activate
+#        - a hard power cut is enough - systemd waited for the device and dropped the machine
+#        into emergency mode: a container platform that would not boot because *dynamic
+#        storage* was missing. kubeos-storage-init writes the corrected line from now on, but
+#        it only runs at first boot, so an existing node needs this one-time repair.
+# SAFE   It only touches the single /etc/fstab line whose mountpoint is
+#        /opt/local-path-provisioner, and only to add what is missing. Re-running is a no-op,
+#        and a machine without that line is left alone.
+set -e
+
+MOUNT=/opt/local-path-provisioner
+FSTAB=/etc/fstab
+warn() { printf 'kubeos-storage: WARNING: %s\n' "$*" >&2; }
+
+case "${1:-}" in
+    configure) : ;;
+    *) exit 0 ;;
+esac
+
+[ -f "$FSTAB" ] || exit 0
+grep -qF " $MOUNT " "$FSTAB" || exit 0
+
+line=$(grep -F " $MOUNT " "$FSTAB" | head -n 1)
+case "$line" in
+    *nofail*) printf 'kubeos-storage: %s already has nofail\n' "$MOUNT" ; exit 0 ;;
+esac
+
+tmp=/etc/.fstab.kubeos-storage.new
+awk -v mount="$MOUNT" '
+    $2 == mount && $0 !~ /nofail/ {
+        $4 = $4 ",nofail,x-systemd.device-timeout=30s"
+        if ($5 == "2") $5 = "0"
+        if ($6 == "2") $6 = "0"
+    }
+    { print }
+' "$FSTAB" > "$tmp" || { warn "could not rewrite $FSTAB"; rm -f "$tmp"; exit 0; }
+cat "$tmp" > "$FSTAB"
+rm -f "$tmp"
+systemctl daemon-reload 2>/dev/null || true
+printf 'kubeos-storage: %s now mounts with nofail (a missing pool can no longer block boot)\n' "$MOUNT"
+exit 0

@@ -1,3 +1,16 @@
+kubeos-storage (1.0.0-1kubeos3) trixie; urgency=medium
+
+  * The pod-data fstab line gets nofail, x-systemd.device-timeout=30s and an fsck pass
+    of 0. Without nofail, a thin pool that fails to activate - a hard power cut is
+    enough - made systemd wait for the device and drop the machine into emergency
+    mode, so the node would not boot at all because dynamic storage was unavailable.
+    Measured on the live node on 2026-11-19 after a power failure.
+  * The postinst repairs an existing /etc/fstab in place: kubeos-storage-init only
+    writes that line at first boot, so upgraded nodes would otherwise keep the
+    dangerous version.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 11:20:00 +0530
+
 kubeos-storage (1.0.0-1kubeos2) trixie; urgency=medium
 
   * Ship the unit enablement as a package file. Build hook 9050 called

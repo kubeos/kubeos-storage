@@ -218,7 +218,15 @@ tmp=/etc/.fstab.kubeos.new
     printf '# KubeOS: pod data on the thin pool (%s/%s). The discard option returns freed\n' "$VG" "$DATA_POOL"
     printf '# blocks to the pool, and fstrim.timer is enabled as well, because online\n'
     printf '# discard is best-effort and a pool that is never trimmed only ever grows.\n'
-    printf 'UUID=%s %s %s defaults,discard 0 2\n' "$uuid" "$DATA_MOUNT" "$FSTYPE"
+    printf '# nofail is not optional: pod data is the ONLY thing this mount holds, and a node\n'
+    printf '# that cannot activate the thin pool (a hard power cut is enough) must still boot -\n'
+    printf '# the cluster runs without dynamic storage, it does not run without a boot. Without\n'
+    printf '# nofail systemd waits for the device, fails the local-fs.target dependency and drops\n'
+    printf '# the machine into emergency mode (measured 2026-11-19 after a power failure).\n'
+    printf '# 0 0, not 0 2: XFS needs no boot-time fsck pass, and a pass here only delays the\n'
+    printf '# failure. x-systemd.device-timeout bounds the wait when the pool is really gone.\n'
+    printf 'UUID=%s %s %s defaults,nofail,x-systemd.device-timeout=30s,discard 0 0\n' \
+        "$uuid" "$DATA_MOUNT" "$FSTYPE"
 } > "$tmp"
 cat "$tmp" > /etc/fstab
 rm -f "$tmp"
