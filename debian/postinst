@@ -28,12 +28,12 @@ esac
 # read $FSTAB explicitly: a grep without a file argument reads STDIN, and in a live-build
 # chroot stdin is the terminal, which hung the first ISO build for 10 minutes at
 # "Setting up kubeos-storage" (measured 2026-11-19).
-grep -qE "^[^#][^ ]*[[:space:]]+$MOUNT[[:space:]]" "$FSTAB" || {
+grep -qE "^[^#][^ ]*[[:space:]]+${MOUNT}[[:space:]]" "$FSTAB" || {
     printf 'kubeos-storage: %s is not in /etc/fstab (no active line); leaving it alone\n' "$MOUNT"
     exit 0
 }
 
-line=$(grep -E "^[^#][^ ]*[[:space:]]+$MOUNT[[:space:]]" "$FSTAB" | head -n 1)
+line=$(grep -E "^[^#][^ ]*[[:space:]]+${MOUNT}[[:space:]]" "$FSTAB" | head -n 1)
 case "$line" in
     *nofail*) printf 'kubeos-storage: %s already has nofail\n' "$MOUNT" ; exit 0 ;;
 esac

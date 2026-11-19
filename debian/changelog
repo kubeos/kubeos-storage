@@ -1,3 +1,12 @@
+kubeos-storage (1.0.0-9) trixie; urgency=medium
+
+  * postinst: brace ${MOUNT} inside the grep patterns. shellcheck reads `$MOUNT[[:space:]]`
+    as an array subscript (SC1087) and fails, and the braces state the intent either way;
+    behaviour is unchanged. Found by running the new CI check over every repository before
+    switching it on.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 01:45:00 +0530
+
 kubeos-storage (1.0.0-8) trixie; urgency=medium
 
   * Debian revision numbering: 1.0.0-1kubeos8 -> 1.0.0-8. The revision is a plain Debian one now
