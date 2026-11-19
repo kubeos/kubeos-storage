@@ -1,3 +1,11 @@
+kubeos-storage (1.0.0-8) trixie; urgency=medium
+
+  * Debian revision numbering: 1.0.0-1kubeos8 -> 1.0.0-8. The revision is a plain Debian one now
+    instead of the 1kubeosN prefix the first uploads used; the upstream version is
+    unchanged. The KubeOS distribution version lives in kubeos-base, which is 0.2.0.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 01:00:00 +0530
+
 kubeos-storage (1.0.0-1kubeos8) trixie; urgency=medium
 
   * Remove a stray grep from the postinst. It had no file argument, so it read stdin - the
