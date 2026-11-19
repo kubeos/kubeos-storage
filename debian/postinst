@@ -24,8 +24,10 @@ esac
 [ -f "$FSTAB" ] || exit 0
 # Commented lines are not a mount: a user may have disabled the mount by hand while
 # recovering, and silently re-enabling it - or worse, reporting that it is now "fixed" -
-# is exactly the kind of surprise this package must not produce.
-grep -E "^[^#].* " 2>/dev/null >/dev/null || true
+# is exactly the kind of surprise this package must not produce. Both greps below therefore
+# read $FSTAB explicitly: a grep without a file argument reads STDIN, and in a live-build
+# chroot stdin is the terminal, which hung the first ISO build for 10 minutes at
+# "Setting up kubeos-storage" (measured 2026-11-19).
 grep -qE "^[^#][^ ]*[[:space:]]+$MOUNT[[:space:]]" "$FSTAB" || {
     printf 'kubeos-storage: %s is not in /etc/fstab (no active line); leaving it alone\n' "$MOUNT"
     exit 0

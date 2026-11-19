@@ -1,3 +1,9 @@
+kubeos-storage (1.0.0-1kubeos8) trixie; urgency=medium
+
+  * Remove a stray grep from the postinst. It had no file argument, so it read stdin - the
+    terminal in a live-build chroot - and blocked the ISO build for 10 minutes at
+    "Setting up kubeos-storage". Caught by watching the build instead of trusting it.
+
 kubeos-storage (1.0.0-1kubeos7) trixie; urgency=medium
 
   * dh_installsystemd gets --no-enable only, not --no-start. --no-start also stops the
