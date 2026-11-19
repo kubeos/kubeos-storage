@@ -1,0 +1,5 @@
+
+# /opt/local-path-provisioner is where the pod-data thin volume is mounted, so the directory and its
+# .kubeos-mountpoint marker must exist in the package or systemd has nothing to mount on. Moving the
+# data root under /var/lib/kubeos is the cleaner long-term fix and is noted as such in MEMORY.md.
+kubeos-storage: dir-or-file-in-opt

@@ -1,3 +1,9 @@
+kubeos-storage (1.0.0-10) trixie; urgency=medium
+
+  * Override dir-or-file-in-opt with its reason. Found by the new CI check.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 02:20:00 +0530
+
 kubeos-storage (1.0.0-9) trixie; urgency=medium
 
   * postinst: brace ${MOUNT} inside the grep patterns. shellcheck reads `$MOUNT[[:space:]]`
