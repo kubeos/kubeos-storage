@@ -1,3 +1,13 @@
+kubeos-storage (1.0.0-1kubeos6) trixie; urgency=medium
+
+  * Stop dh_installsystemd from enabling and starting/restarting units by itself. It
+    were enabling flanneld.service - which hook 9050 documents as never-to-enable, since
+    it cannot run as a host service - and it restarted units on every upgrade, including
+    control-plane units that must not start before node-setup has written the PKI. The
+    .wants links shipped in the package now decide, and nothing else.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 12:20:00 +0530
+
 kubeos-storage (1.0.0-1kubeos5) trixie; urgency=medium
 
   * kubeos-storage-init detects a damaged thin pool instead of letting the machine find

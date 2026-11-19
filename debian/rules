@@ -7,3 +7,11 @@
 override_dh_installdeb:
 	dh_installdeb
 	: > debian/kubeos-storage/DEBIAN/conffiles
+
+# dh_installsystemd would enable and start/restart every unit in this package on its own,
+# which bypasses two rules this platform depends on: flanneld must NOT be enabled (hook
+# 9050 says so - it cannot run as a host service), and nothing may start a control-plane
+# unit before node-setup has written the PKI. The .wants links shipped in the package state
+# exactly which units are enabled; first boot and systemd's own ordering do the rest.
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start
