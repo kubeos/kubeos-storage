@@ -12,6 +12,11 @@
 #        and a machine without that line is left alone.
 set -e
 
+# debhelper inserts its generated snippets here (systemd enable/reload, dpkg-maint-script
+# helpers). It must sit before this script's own exits, otherwise they never run - that is
+# exactly how every KubeOS package ended up with units debhelper never enabled.
+#DEBHELPER#
+
 MOUNT=/opt/local-path-provisioner
 FSTAB=/etc/fstab
 warn() { printf 'kubeos-storage: WARNING: %s\n' "$*" >&2; }

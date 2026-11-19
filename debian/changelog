@@ -1,3 +1,12 @@
+kubeos-storage (1.0.0-11) trixie; urgency=medium
+
+  * Add the #DEBHELPER# marker to postinst. Without it dh_installdeb silently inserts no
+    snippets at all - no systemd reload, no unit enablement, no dpkg-maintscript helpers - and
+    the package looks fine because the shipped .wants links start the units anyway. Found while
+    packaging kubeos-containerd; kubeos-storage is the one here that ships units.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 05:00:00 +0530
+
 kubeos-storage (1.0.0-10) trixie; urgency=medium
 
   * Override dir-or-file-in-opt with its reason. Found by the new CI check.
