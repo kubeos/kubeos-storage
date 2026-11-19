@@ -1,3 +1,14 @@
+kubeos-storage (1.0.0-1kubeos7) trixie; urgency=medium
+
+  * dh_installsystemd gets --no-enable only, not --no-start. --no-start also stops the
+    units during an upgrade and never starts them again: upgrading this package took the
+    whole control plane down (all eight units inactive, kubectl refused on :6443), measured
+    on the live node on 2026-11-19. --no-enable alone is what was needed - it stops the
+    package from enabling units (flanneld above all), while the normal stop/start around a
+    binary upgrade keeps the cluster running.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 12:40:00 +0530
+
 kubeos-storage (1.0.0-1kubeos6) trixie; urgency=medium
 
   * Stop dh_installsystemd from enabling and starting/restarting units by itself. It

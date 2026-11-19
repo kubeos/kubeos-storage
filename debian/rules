@@ -9,9 +9,11 @@ override_dh_installdeb:
 	: > debian/kubeos-storage/DEBIAN/conffiles
 
 # dh_installsystemd would enable and start/restart every unit in this package on its own,
-# which bypasses two rules this platform depends on: flanneld must NOT be enabled (hook
-# 9050 says so - it cannot run as a host service), and nothing may start a control-plane
-# unit before node-setup has written the PKI. The .wants links shipped in the package state
-# exactly which units are enabled; first boot and systemd's own ordering do the rest.
+# which makes flanneld run: hook 9050 says it must stay disabled, because it cannot run as a
+# host service. --no-enable is the whole fix - enabling is the only thing to prevent, and the
+# .wants links shipped in the package state exactly which units are enabled on a fresh install.
+# --no-start must NOT be added: it also stops the units during an upgrade and never starts
+# them again, which took the entire control plane down on 2026-11-19 (measured). Restarting a
+# unit around a binary replacement is what Debian does, and it is what we want.
 override_dh_installsystemd:
-	dh_installsystemd --no-enable --no-start
+	dh_installsystemd --no-enable
