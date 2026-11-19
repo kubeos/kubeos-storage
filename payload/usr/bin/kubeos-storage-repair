@@ -1,0 +1,125 @@
+#!/bin/sh
+# KubeOS: repair a damaged pod-data thin pool.
+#
+# WHEN   after kubeos-storage-init or the journal says the pool needs repair, which is what a
+#        hard power cut leaves behind (measured 2026-11-19: "Check of pool kubeos-vg/kubeos-data
+#        failed (status:64). Manual repair required!" and the node booted into emergency mode):
+#            kubeos-storage-repair              # show what is wrong, change nothing
+#            kubeos-storage-repair --yes        # rebuild the metadata from the spare copy
+#
+# WHY    LVM keeps a spare copy of the thin-pool metadata (lvol0_pmspare/lvol1_pmspare). When the
+#        live copy is corrupt, `lvconvert --repair` rebuilds it from that spare, which is the
+#        difference between a node whose pod data is intact and a node that must be re-created.
+#        The command exists because the alternative we saw in practice was a human pasting three
+#        LVM incantations from memory while the machine sat in emergency mode.
+#
+# SAFE   It refuses to do anything unless the pool really is damaged, and it requires --yes
+#        because repair is destructive: thin volumes whose mapping lived in the corrupt region
+#        are lost, even though the metadata is restored. The unrepaired metadata is kept as
+#        kubeos-vg/kubeos-data_meta0 so it can be examined; pod data on a shifted file is
+#        preferable to pod data on a pool LVM refuses to activate, and this never touches
+#        lv-root, the volume group's other volumes, or anything outside kubeos-vg.
+set -eu
+
+VG=kubeos-vg
+POOL=kubeos-data
+LV=pod-data
+DATA_MOUNT=/opt/local-path-provisioner
+STATE_DIR=/var/lib/kubeos
+MARKER=$STATE_DIR/storage-damaged
+
+log() { printf 'kubeos-storage-repair: %s\n' "$*"; }
+warn() { printf 'kubeos-storage-repair: WARNING: %s\n' "$*" >&2; }
+die() { printf 'kubeos-storage-repair: ERROR: %s\n' "$*" >&2; exit 1; }
+
+CONFIRM=0
+for arg in "$@"; do
+    case "$arg" in
+        --yes) CONFIRM=1 ;;
+        -n | --dry-run) CONFIRM=0 ;;
+        -h | --help)
+            sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) die "unknown argument: $arg (try --help)" ;;
+    esac
+done
+
+[ "$(id -u)" -eq 0 ] || die "run this as root"
+
+for tool in lvs vgchange lvconvert blkid; do
+    command -v "$tool" >/dev/null 2>&1 || die "$tool is not installed (lvm2)"
+done
+
+lvs "$VG/$POOL" >/dev/null 2>&1 || die "there is no thin pool $VG/$POOL on this machine"
+
+# --- is it really damaged? ---------------------------------------------------
+DETAIL=""
+CHECK=$(vgchange -ay "$VG" 2>&1 || true)
+case "$CHECK" in
+    *[Rr]epair* | *"Check of pool"*)
+        DETAIL=$(printf '%s\n' "$CHECK" | grep -iE 'repair required|check of pool .* failed' | head -n 1)
+        ;;
+esac
+if [ -z "$DETAIL" ] && [ -s "$MARKER" ]; then
+    DETAIL=$(head -n 1 "$MARKER")
+fi
+if [ -z "$DETAIL" ]; then
+    log "the thin pool $VG/$POOL activates without complaint - nothing to repair"
+    log "pool state: $(lvs --noheadings -o lv_attr "$VG/$POOL" | tr -d ' ')"
+    [ -e "$MARKER" ] && warn "$MARKER still exists from an earlier failure; removing it" && rm -f "$MARKER"
+    exit 0
+fi
+
+log "the pool is damaged: $DETAIL"
+log "thin volumes right now:"
+lvs --noheadings -o lv_name,lv_attr,lv_size "$VG" | sed 's/^/  /'
+
+if [ "$CONFIRM" -ne 1 ]; then
+    printf '\nNothing has been changed. Repair with:\n\n    kubeos-storage-repair --yes\n\n' >&2
+    printf 'Read the warnings in the header of this script first: repair rebuilds the thin-pool\n' >&2
+    printf 'metadata from the spare copy, and thin volumes mapped through the damaged region are lost.\n' >&2
+    exit 1
+fi
+
+# --- repair ------------------------------------------------------------------
+if mountpoint -q "$DATA_MOUNT"; then
+    log "unmounting $DATA_MOUNT first (the pool cannot be repaired while it is in use)"
+    umount "$DATA_MOUNT" || die "could not unmount $DATA_MOUNT; stop the workloads using it first"
+fi
+
+log "rebuilding the thin-pool metadata from the spare copy"
+lvconvert --repair --force "$VG/$POOL" 2>&1 | sed 's/^/  /' \
+    || die "lvconvert --repair failed; the pool was not changed"
+
+log "activating the volume group"
+vgchange -ay "$VG" 2>&1 | sed 's/^/  /' || true
+
+if ! lvs "$VG/$LV" >/dev/null 2>&1; then
+    die "the thin volume $VG/$LV did not come back after the repair; pod data is not mounted"
+fi
+uuid=$(blkid -s UUID -o value "/dev/$VG/$LV" 2>/dev/null || true)
+if [ -z "${uuid:-}" ]; then
+    die "/dev/$VG/$LV has no filesystem UUID after the repair; do NOT reformat it blindly - inspect it with blkid"
+fi
+log "/dev/$VG/$LV is back: UUID $uuid"
+
+# Hand the rest to the normal first-boot script: it rewrites the fstab line, mounts and
+# re-enables the trim timer, so the machine ends up exactly as a healthy node looks.
+if [ -x /usr/bin/kubeos-storage-init ]; then
+    log "finishing with kubeos-storage-init"
+    /usr/bin/kubeos-storage-init || warn "kubeos-storage-init reported a problem after the repair"
+fi
+
+rm -f "$MARKER"
+BACKUP=$(lvs --noheadings -o lv_name "$VG" 2>/dev/null | tr -d ' ' | grep -E '^'"$POOL"'_meta[0-9]+$' | head -n 1)
+if [ -n "$BACKUP" ]; then
+    log "the unrepaired metadata is kept as $VG/$BACKUP"
+    log "  remove it once the node has run happily for a while: lvremove $VG/$BACKUP"
+fi
+if mountpoint -q "$DATA_MOUNT"; then
+    log "done: pod data is mounted again at $DATA_MOUNT"
+else
+    warn "the pool is repaired but $DATA_MOUNT is not mounted; check: journalctl -u node-setup -b"
+fi
+exit 0

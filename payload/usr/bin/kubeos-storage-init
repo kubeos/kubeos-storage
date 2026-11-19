@@ -175,6 +175,26 @@ else
     fi
 fi
 
+# ---- 1b. is the pool damaged? (a hard power cut is enough) -------------------
+# LVM's own activation check is the only cheap way to find a broken thin pool, and its
+# complaint goes to stderr with the activation result. Ask for activation explicitly and
+# read what it says: "Check of pool ... failed ... Manual repair required!" means the
+# metadata is corrupt, which is exactly the state that made a node unbootable on
+# 2026-11-19. Report it here, in one place, and leave a marker the dashboard can show.
+DAMAGED_MARKER=$STATE_DIR/storage-damaged
+if vgchange -ay "$VG" 2>&1 | tee /tmp/kubeos-vgchange.$$ | grep -qiE 'repair required|check of pool .* failed'; then
+    detail=$(grep -iE 'repair required|check of pool .* failed' /tmp/kubeos-vgchange.$$ | head -n 1)
+    rm -f /tmp/kubeos-vgchange.$$
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$detail" > "$DAMAGED_MARKER"
+    warn "the thin pool $VG/$DATA_POOL is DAMAGED: $detail"
+    warn "pod data stays where it is and the node keeps running, but dynamic storage is unavailable"
+    warn "repair it with: kubeos-storage-repair     (it rebuilds the metadata from the spare copy)"
+    exit 0
+fi
+rm -f /tmp/kubeos-vgchange.$$
+rm -f "$DAMAGED_MARKER"
+
 if ! lvs "$VG/$DATA_LV" >/dev/null 2>&1; then
     warn "thin volume $VG/$DATA_LV is missing although the pool exists; pod data stays on /"
     exit 0

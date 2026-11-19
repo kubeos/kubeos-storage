@@ -1,3 +1,15 @@
+kubeos-storage (1.0.0-1kubeos5) trixie; urgency=medium
+
+  * kubeos-storage-init detects a damaged thin pool instead of letting the machine find
+    out the hard way. A hard power cut can corrupt the LVM thin metadata, and until now
+    nothing said so: the node simply failed to mount pod data (and, before nofail, failed
+    to boot). It now runs the activation check itself, logs the reason, and writes
+    /var/lib/kubeos/storage-damaged for the dashboard.
+  * New command: kubeos-storage-repair. It refuses to touch a healthy pool, requires --yes
+    because repair can discard thin volumes, rebuilds the metadata from the spare copy,
+    then hands over to kubeos-storage-init so the mount and the fstab line end up correct.
+    The unrepaired metadata is kept as kubeos-vg/kubeos-data_metaN and the command says so.
+
 kubeos-storage (1.0.0-1kubeos4) trixie; urgency=medium
 
   * The postinst must ignore commented-out fstab lines. On the live node the pod-data
