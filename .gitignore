@@ -6,3 +6,5 @@ debian/kubeos-storage/
 *.deb
 *.buildinfo
 *.changes
+__pycache__/
+*.pyc
