@@ -1,3 +1,75 @@
+kubeos-storage (1.0.0-16) trixie; urgency=medium
+
+  * The sweep now says when it declines to act because the volume record belongs to a
+    different cluster. Without that line "the guard worked" and "the sweep is broken" look
+    exactly the same in the journal - and this is the branch that keeps a removed node's
+    data alive.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 09:40:00 +0530
+
+kubeos-storage (1.0.0-15) trixie; urgency=medium
+
+  * The cluster identity the sweep relies on is now read from LOCAL files instead of the
+    API. 1.0.0-12 asked for the kube-system namespace UID, which this service's own narrow
+    ClusterRole forbids ("User system:storage-provisioner cannot get resource namespaces"),
+    so the round aborted before provisioning and every new claim stayed Pending - caught
+    on the test cluster within minutes, and exactly the kind of regression a permission
+    assumption creates. The identity is now the cluster CA every node holds
+    (/etc/kubeos-dashboard/ca.crt) plus the API server its kubeconfig names: both are
+    cluster-specific, both are local, and the CA is what changes when a node becomes its
+    own cluster again (verified on kubeos2: rewritten at the standalone rebuild, adopted
+    from the cluster again when it re-joined).
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 09:20:00 +0530
+
+kubeos-storage (1.0.0-14) trixie; urgency=medium
+
+  * The sweep timer schedules its first run relative to when IT becomes active
+    (OnActiveSec) instead of relative to boot (OnBootSec). Measured 2026-11-20 on all
+    three nodes immediately after 1.0.0-13 was installed: the timer was `active` and
+    `systemctl list-timers` answered `next -`, so nothing would ever have run until the
+    next reboot - OnBootSec was already in the past, and OnUnitActiveSec only repeats
+    after a first run that never happened.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 09:14:00 +0530
+
+kubeos-storage (1.0.0-13) trixie; urgency=medium
+
+  * The sweep timer now actually starts when the package is installed. A .wants link
+    shipped in a package starts a timer only when timers.target is next activated, i.e. at
+    the next boot: measured 2026-11-20 right after installing 1.0.0-12, the unit, the link
+    and `systemctl cat` were all correct while `systemctl list-timers` showed nothing, so
+    the sweep would not have existed until a reboot. postinst starts it now (and warns,
+    rather than failing, if it cannot); the shipped link keeps it enabled at every boot.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 09:12:00 +0530
+
+kubeos-storage (1.0.0-12) trixie; urgency=medium
+
+  * SECURITY/DATA: a removed node no longer destroys its persistent volumes. The orphan
+    sweep deleted every `pvc-*` directory that the CURRENT cluster does not reference, and
+    the one-node cluster a removed node rebuilds for itself references nothing - so the
+    sweep wiped the data of the cluster that node had just left. Measured 2026-11-20 on the
+    three-node test cluster: `reclaimed /opt/local-path-provisioner/pvc-8ba46de5… (no PVC
+    and no PV references it)` at the moment the standalone rebuild started, and afterwards
+    the pod restarted "successfully" on an empty volume, while the user guide promises the
+    data is left untouched. The sweep now only removes a directory this cluster is on
+    record as having owned; that record (`/var/lib/kubeos/storage-provisioned`) names the
+    cluster it belongs to by the kube-system UID, because the file itself survives the
+    rebuild and a bare list of names would still point at the old volumes. A directory of
+    unknown origin is left alone: a leak is recoverable, deleted data is not.
+  * A deleted claim whose volume lived on a WORKER now frees its disk. Only the control
+    plane ran the provisioner, so the directory on the worker that hosted the volume was
+    never reclaimed (measured 2026-11-20: 0 PVs, 0 PVCs, the directory still there).
+    New `kubeos-storage-gc.service` + `.timer`: a oneshot every five minutes on EVERY
+    node, running the provisioner with `--sweep-only`, which reclaims and never
+    provisions - a worker still cannot create volumes.
+  * The provisioner picks its cluster identity from `/etc/kubernetes/storage-provisioner.conf`
+    on a control plane and falls back to `/etc/kubeos-dashboard/kubeconfig` on a worker,
+    which is what lets the sweep run there at all.
+
+ -- KubeOS <mail@kubeos.in>  Fri, 20 Nov 2026 09:10:00 +0530
+
 kubeos-storage (1.0.0-11) trixie; urgency=medium
 
   * Add the #DEBHELPER# marker to postinst. Without it dh_installdeb silently inserts no
@@ -36,6 +108,8 @@ kubeos-storage (1.0.0-1kubeos8) trixie; urgency=medium
     terminal in a live-build chroot - and blocked the ISO build for 10 minutes at
     "Setting up kubeos-storage". Caught by watching the build instead of trusting it.
 
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 20:00:00 +0530
+
 kubeos-storage (1.0.0-1kubeos7) trixie; urgency=medium
 
   * dh_installsystemd gets --no-enable only, not --no-start. --no-start also stops the
@@ -68,6 +142,8 @@ kubeos-storage (1.0.0-1kubeos5) trixie; urgency=medium
     because repair can discard thin volumes, rebuilds the metadata from the spare copy,
     then hands over to kubeos-storage-init so the mount and the fstab line end up correct.
     The unrepaired metadata is kept as kubeos-vg/kubeos-data_metaN and the command says so.
+
+ -- KubeOS <mail@kubeos.in>  Thu, 19 Nov 2026 12:05:00 +0530
 
 kubeos-storage (1.0.0-1kubeos4) trixie; urgency=medium
 

@@ -28,16 +28,33 @@
 #
 # SAFE   Re-runnable and idempotent: creating an existing PV is a no-op (AlreadyExists
 #        is the expected answer, not an error), an existing directory is reused, and
-#        the orphan sweep only removes a directory when NEITHER a PVC nor a PV
-#        references its uid - and it is skipped entirely for a round in which the PV
-#        list could not be read. It never deletes a bound volume. Failures are logged
-#        and retried on the next round; the process does not exit on API errors (a
-#        provisioner that dies stops all future storage).
+#        the orphan sweep only removes a directory when ALL THREE hold - no PVC and no
+#        PV references it now, the PV list could be read this round, AND this cluster
+#        is known to have owned that volume (see below). It never deletes a bound
+#        volume. Failures are logged and retried on the next round; the process does
+#        not exit on API errors (a provisioner that dies stops all future storage).
+#
+# WHY THE RECORD FILE (measured 2026-11-20, silent data loss): "no PV names this
+#        directory" only proves garbage when THIS cluster created the volume. The
+#        removed node KubeOS rebuilds for itself (kubeos-node-standalone) comes up as a
+#        brand-new one-node cluster whose PV list is EMPTY - so the sweep deleted every
+#        volume of the cluster that node had just left, and the workload restarted
+#        "successfully" on an empty directory while the docs promised the data was left
+#        untouched. The sweep is therefore limited to names this node has seen in THIS
+#        cluster, kept in /var/lib/kubeos/storage-provisioned together with the
+#        cluster's identity (the kube-system UID): the same file survives a standalone
+#        rebuild, and the identity is what says whether it still applies.
+#
+# --sweep-only  One reclaim+sweep round, then exit. kubeos-storage-gc.timer runs it on
+#        EVERY node, including workers: a worker's provisioner is disabled (it must not
+#        provision anything), but the directories of volumes that lived on that worker
+#        still have to be reclaimed there, or deleting a claim leaks the disk for ever.
 #
 # Volumes live on the node's own disk: /opt/local-path-provisioner is the XFS
 # pod-data LV that kubeos-storage-init creates, NOT a directory on the root
 # filesystem. Keep DATA_ROOT in sync with DATA_MOUNT in that script.
 
+import hashlib
 import json
 import os
 import shutil
@@ -46,8 +63,21 @@ import subprocess
 import sys
 import time
 
-KUBECONFIG = os.environ.get("KUBECONFIG", "/etc/kubernetes/storage-provisioner.conf")
+# The control plane mints a deliberately narrow identity for this service; a worker has
+# no such file (its provisioner stays disabled) but does carry the dashboard's cluster
+# identity, which is what the sweep-only mode needs to read the cluster's PV list.
+KUBECONFIG_CANDIDATES = (
+    "/etc/kubernetes/storage-provisioner.conf",
+    "/etc/kubeos-dashboard/kubeconfig",
+)
+KUBECONFIG = os.environ.get("KUBECONFIG") or next(
+    (path for path in KUBECONFIG_CANDIDATES if os.path.exists(path)), KUBECONFIG_CANDIDATES[0])
 DATA_ROOT = "/opt/local-path-provisioner"
+# What this node knows about the volumes of the cluster it belongs to, plus that
+# cluster's identity. Lives on the root LV so it outlives a node rebuilding itself.
+RECORD_PATH = "/var/lib/kubeos/storage-provisioned"
+# The cluster CA as every node holds it: the same bytes on every node of a cluster.
+IDENTITY_FILES = ("/etc/kubeos-dashboard/ca.crt", "/etc/kubernetes/pki/ca.crt")
 CLASS_NAME = "local-path"
 POLL_SECONDS = 5
 KUBECTL_TIMEOUT = 30
@@ -116,6 +146,77 @@ def list_json(resource, extra=(), quiet=False):
     except json.JSONDecodeError as exc:
         log(f"WARNING: could not parse kubectl output for {resource}: {exc}")
         return None
+
+
+def cluster_identity():
+    """A value that is the SAME on every node of one cluster and DIFFERENT in another.
+
+    WHY NOT the kube-system namespace UID: this service runs under a deliberately narrow
+    identity (`system:storage-provisioner`, whose ClusterRole allows claims, PVs and nodes
+    only), so reading namespaces is Forbidden - measured 2026-11-20, and because the sweep
+    then never ran, provisioning stopped altogether. Local facts need no permission at all:
+    the cluster CA that every node trusts (adopted from the cluster's Secret when it joins,
+    regenerated when a node rebuilds itself) plus the API server its kubeconfig names.
+    The CA is what changes when a node becomes its own cluster again - verified on
+    kubeos2 on 2026-11-20: its ca.crt was rewritten from the cluster's to its own at the
+    standalone rebuild and back to the cluster's when it re-joined.
+    """
+    server = ""
+    try:
+        with open(KUBECONFIG, encoding="utf-8") as handle:
+            for line in handle:
+                text = line.strip().replace('"', "")
+                if text.startswith("server:"):
+                    server = text[len("server:"):].strip()
+                    break
+    except OSError:
+        pass
+    digest = ""
+    for path in IDENTITY_FILES:
+        try:
+            with open(path, "rb") as handle:
+                digest = hashlib.sha256(handle.read()).hexdigest()[:16]
+            break
+        except OSError:
+            continue
+    if not server and not digest:
+        log(f"WARNING: no cluster identity yet ({KUBECONFIG} and {IDENTITY_FILES[0]})")
+        return None
+    return f"{server}|{digest}"
+
+
+def load_record(identity):
+    """Volume names this node has seen in THIS cluster. None when the file is unreadable."""
+    try:
+        with open(RECORD_PATH, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        log(f"WARNING: could not read {RECORD_PATH}: {exc}")
+        return None
+    if not lines or lines[0].strip() != f"cluster {identity}":
+        # Written by another cluster: it says nothing about the volumes here. Say so:
+        # otherwise "the sweep did nothing" looks identical to "the sweep is broken", and
+        # this is the branch that protects a removed node's data.
+        if lines:
+            log(f"sweep guard: the volume record belongs to {lines[0].strip()[len('cluster '):]}"
+                f", this node is in {identity} - nothing here is reclaimed this round")
+        return set()
+    return {line.strip() for line in lines[1:] if line.strip()}
+
+
+def save_record(identity, names):
+    try:
+        os.makedirs(os.path.dirname(RECORD_PATH), exist_ok=True)
+        tmp = RECORD_PATH + ".new"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(f"cluster {identity}\n")
+            for name in sorted(names):
+                handle.write(name + "\n")
+        os.replace(tmp, RECORD_PATH)
+    except OSError as exc:
+        log(f"WARNING: could not write {RECORD_PATH}: {exc}")
 
 
 def volume_dir(uid):
@@ -254,44 +355,67 @@ def reclaim(pvs):
     return deleted
 
 
-def sweep(pvs, claims):
-    """Remove directories whose uid nothing references any more."""
-    if pvs is None or claims is None:
-        # One of the two lists is unknown: deleting now could destroy a live volume.
+def sweep(pvs, claims, record):
+    """Remove the directories of volumes THIS cluster owned and no longer references.
+
+    WHY the record: "no PV names this directory" is only evidence of garbage when this
+    cluster created the volume. On the fresh one-node cluster that a removed node builds
+    for itself the PV list is simply empty, and an unguarded sweep deleted every volume
+    of the cluster the node had just left - measured 2026-11-20, and invisible, because
+    the pod then restarted Happily on the empty directory that DirectoryOrCreate made.
+    A directory this cluster never owned is left alone: a leak is recoverable, deleted
+    data is not.
+    """
+    if pvs is None or claims is None or record is None:
+        # One of the three inputs is unknown: deleting now could destroy a live volume.
         log("WARNING: skipping the orphan sweep this round (a list could not be read)")
-        return
+        return False
     live = {pv["metadata"]["name"] for pv in pvs if pv["metadata"]["name"].startswith("pvc-")}
     live |= {c["metadata"]["uid"] for c in claims}
     try:
         entries = os.listdir(DATA_ROOT)
     except OSError as exc:
         log(f"WARNING: could not read {DATA_ROOT}: {exc}")
-        return
+        return False
+    changed = False
     for entry in entries:
         if not entry.startswith("pvc-"):
             continue
         name = entry[len("pvc-"):]
-        if f"pvc-{name}" in live or name in live:
+        if entry in live or name in live:
+            continue
+        if entry not in record:
+            # Not ours to judge: created by another cluster, or before this node joined.
             continue
         path = os.path.join(DATA_ROOT, entry)
         try:
             shutil.rmtree(path)
-            log(f"reclaimed {path} (no PVC and no PV references it)")
         except OSError as exc:
             log(f"WARNING: could not remove {path}: {exc}")
+            continue
+        record.discard(entry)
+        changed = True
+        log(f"reclaimed {path} (this cluster owned it, and its claim and volume are gone)")
+    return changed
 
 
-def one_round():
+def one_round(sweep_only=False):
     global API_READY
+    # The cluster's identity first: it decides whether the record file on this node still
+    # describes the cluster it is talking to (see load_record).
+    identity = cluster_identity()
+    if identity is None:
+        return
     claims = list_json("pvc", ("--all-namespaces",), quiet=not API_READY)
     if claims is None:
         return
     if not API_READY:
         API_READY = True
         log("API reachable; watching claims")
-    for claim in claims:
-        if claim_wants_us(claim):
-            provision(claim)
+    if not sweep_only:
+        for claim in claims:
+            if claim_wants_us(claim):
+                provision(claim)
     # Sweep from a fresh view: after provisioning, so a PV created above is not seen
     # as absent, and after a failed claim list the sweep is skipped entirely. If the
     # reclaim step removed a PV, the list must be read again or the sweep would still
@@ -299,14 +423,40 @@ def one_round():
     pvs = list_json("pv")
     if reclaim(pvs):
         pvs = list_json("pv")
-    sweep(pvs, claims)
+    record = load_record(identity)
+    if record is None:
+        return
+    # Remember every volume this cluster owns, so a later round can tell an orphaned
+    # directory (ours) from another cluster's data (not ours).
+    seen = {pv["metadata"]["name"] for pv in (pvs or [])
+            if pv["metadata"]["name"].startswith("pvc-")}
+    if not seen.issubset(record):
+        record |= seen
+        save_record(identity, record)
+    if sweep(pvs, claims, record):
+        save_record(identity, record)
 
 
 def main():
+    sweep_only = "--sweep-only" in sys.argv[1:]
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, on_term)
-    if not os.path.isdir(DATA_ROOT):
+    mounted = os.path.isdir(DATA_ROOT)
+    if not mounted:
         log(f"WARNING: {DATA_ROOT} does not exist (is the pod-data volume mounted?)")
+    if sweep_only:
+        # Run from kubeos-storage-gc.timer on EVERY node, workers included: the worker
+        # whose disk held a volume is the only place that volume's directory can be
+        # reclaimed, and a worker's daemon is disabled on purpose (it must not provision).
+        log(f"sweep-only: reclaiming {DATA_ROOT} against the cluster at {KUBECONFIG}")
+        if not mounted:
+            return 0
+        try:
+            one_round(sweep_only=True)
+        except Exception as exc:  # noqa: BLE001 - a timer must not report a crash as success
+            log(f"ERROR: sweep-only round failed: {exc}")
+            return 1
+        return 0
     log(f"watching for Pending claims with storageClassName {CLASS_NAME}, root {DATA_ROOT}")
     while not STOP:
         try:

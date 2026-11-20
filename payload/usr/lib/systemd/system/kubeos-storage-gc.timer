@@ -1,0 +1,23 @@
+# KubeOS: run the storage sweep every five minutes on every node.
+#
+# WHY NOT MORE OFTEN: a deleted volume's directory is not urgent, and the sweep must not
+# race a join - during a join this node is re-pointed at another cluster, and the record
+# file is what keeps the sweep honest while that happens (AGENTS.md section 14).
+[Unit]
+Description=KubeOS storage sweep every 5 minutes
+Documentation=https://kubeos.in/
+
+[Timer]
+# OnActiveSec, NOT OnBootSec: this timer is also started by the package's postinst on a
+# running machine, and OnBootSec is already in the past by then - the timer would sit
+# "active" with no next elapse and never fire until the next reboot (measured 2026-11-20:
+# `systemctl list-timers` answered "next -" on all three nodes right after the upgrade).
+# OnActiveSec is relative to whenever the timer itself becomes active, so it covers both
+# a boot and an install; OnUnitActiveSec then repeats from the last run.
+OnActiveSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=kubeos-storage-gc.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,26 @@
+# KubeOS: reclaim the directories of deleted volumes, on EVERY node.
+#
+# WHY THIS IS SEPARATE FROM THE PROVISIONER: a volume's directory lives on the node that
+# hosted it, but only the control plane runs the provisioner daemon - so when a claim whose
+# data lived on a WORKER was deleted, the PV object went away and the directory stayed for
+# ever (measured 2026-11-20: 0 PVs, 0 PVCs, the directory still on kubeos2). This oneshot
+# unit runs the provisioner in --sweep-only mode, which does the reclaim step and nothing
+# else: it never provisions, so a worker still cannot create volumes.
+#
+# It is the same code path that guards the data-loss case: the sweep only deletes a
+# directory this cluster is on record as having owned, so the fresh single-node cluster a
+# removed node builds for itself cannot touch the volumes of the cluster it just left.
+[Unit]
+Description=KubeOS storage sweep (reclaim deleted volumes' directories)
+Documentation=https://kubeos.in/
+After=network-online.target
+Wants=network-online.target
+# The sweep needs a cluster identity to talk to: the control plane's own narrow
+# certificate, or (on a worker) the dashboard's kubeconfig. Either one will do.
+ConditionPathExists=|/etc/kubernetes/storage-provisioner.conf
+ConditionPathExists=|/etc/kubeos-dashboard/kubeconfig
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kubeos-storage-provisioner --sweep-only
+TimeoutStartSec=120
